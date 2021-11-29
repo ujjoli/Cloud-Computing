@@ -1,0 +1,121 @@
+import boto3
+
+
+
+s3 = boto3.client("s3")
+
+#my_bucket = s3.Bucket("2021-cloudcomputing-group1-final")
+
+import pandas as pd
+
+obj = s3.get_object(Bucket= "2021-cloudcomputing-group1-final", Key = "DisasterDeclarationsSummaries.csv")
+
+disaster_zip = pd.read_csv(obj['Body'])
+
+
+
+disaster_zip = disaster_zip[disaster_zip['declaredCountyArea'].str.find("(") >0]
+
+disaster_zip["paren_index"] = disaster_zip['declaredCountyArea'].str.find("(")
+
+def f(x):
+    return x['declaredCountyArea'][:x['paren_index'] -1 ]
+disaster_zip['county'] = disaster_zip.apply(f, 1)
+
+
+
+
+# Keep Only One Record Per County With Ongoing Disaster
+
+ongoing_dis = disaster_zip[disaster_zip['disasterCloseOutDate'].isnull()]
+ongoing_dis = ongoing_dis.drop_duplicates(subset=['county'])
+
+
+
+from io import StringIO
+obj1 = s3.get_object(Bucket= "2021-cloudcomputing-group1-final", Key = "fips-by-state.csv")
+
+
+#all_county = pd.read_csv(obj1['Body'], encoding='unicode_escape')
+
+import io
+all_county = pd.read_csv(io.BytesIO(obj1["Body"].read()), encoding ="latin", dtype={"fips" :str})
+
+def f(x):
+    return x['name'].rsplit(' ', 1)[0]
+
+all_county['county_name'] = all_county.apply(f, 1)
+print(all_county.head())
+print(ongoing_dis.head())
+
+
+county_merge = pd.merge(all_county, ongoing_dis[['state','county']], how = 'left', left_on=['state', 'county_name'], right_on = ['state', 'county'], indicator=True)
+
+county_merge = county_merge.rename(columns={"_merge" : "status"})
+county_merge['status'] = county_merge['status'].replace(['both'],'Active Disaster')
+county_merge['status'] = county_merge['status'].replace(['left_only'],'No-active Disaster')
+print(county_merge)
+
+
+from urllib.request import urlopen
+import json
+with urlopen('https://raw.githubusercontent.com/plotly/datasets/master/geojson-counties-fips.json') as response:
+    counties = json.load(response)
+import plotly.express as px
+print(county_merge['status'].value_counts())
+fig = px.choropleth(county_merge, geojson=counties, locations='fips', color='status',
+                           scope="usa",hover_data=["status"]
+                          )
+fig.update_layout(margin={"r":0,"t":0,"l":0,"b":0})
+fig.write_image("fig1.jpeg")
+fig.show()
+
+
+s3_r = boto3.resource("s3")
+s3_r.meta.client.upload_file('fig1.jpeg', '2021-cloudcomputing-group1-final', 'fig1.jpeg')
+
+
+import pymysql
+
+db = pymysql.connect(host ="final-project-database.ckqs3et5ve3r.us-east-1.rds.amazonaws.com",user ="admin", password="DBpassword!", db="FemaDisaster")
+
+cursor = db.cursor()
+
+cursor.execute("SELECT VERSION()")
+
+data =cursor.fetchone()
+print ("Database version : %s " % data)
+
+
+ongoing_dis = ongoing_dis.drop(['disasterNumber', 'ihProgramDeclared', 'iaProgramDeclared', 'paProgramDeclared', 'hmProgramDeclared','fyDeclared', 'disasterType', 'incidentType',
+'hash', 'lastRefresh', 'id', 'declarationDate'], axis = 1)
+
+ongoing_dis["incidentEndDate"] = ongoing_dis["incidentEndDate"].fillna("ongoing")
+
+ongoing_dis["disasterCloseOutDate"] = ongoing_dis["disasterCloseOutDate"].fillna("ongoing")
+
+ongoing_dis.dropna(inplace=True)
+
+cursor.execute("drop table  if exists Disaster;")
+
+print('Creating table....')
+
+
+cursor.execute("CREATE TABLE Disaster (State VARCHAR(2), Title VARCHAR(50), IncidentBeginDate VARCHAR(20), IncidentEndDate VARCHAR(20), DisasterCloseOutDate VARCHAR(20),
+DeclaredCountyArea VARCHAR(100), PlaceCode VARCHAR(5), ParenIndex VARCHAR(4), County VARCHAR(100));")
+
+print('Table created....')
+
+for i, row in ongoing_dis.iterrows():
+        sql =  "INSERT INTO Disaster VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+        
+       	cursor.execute(sql, tuple(row))
+
+        print("Record inserted")
+
+
+        db.commit()
+
+
+db.close()
+
